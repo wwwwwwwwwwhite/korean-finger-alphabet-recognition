@@ -3,7 +3,25 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
-from .constants import LABELS, LANDMARK_COUNT
+from .constants import LANDMARK_COUNT
+
+
+def normalize_label(value: str) -> str:
+    value = value.strip()
+    if not value or len(value) > 24 or not value.isprintable():
+        raise ValueError("label must contain 1 to 24 printable characters")
+    return value
+
+
+class CustomLabelInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str) -> str:
+        return normalize_label(value)
 
 
 class Landmark(BaseModel):
@@ -38,9 +56,7 @@ class SampleInput(BaseModel):
     @field_validator("label")
     @classmethod
     def validate_label(cls, value: str) -> str:
-        if value not in LABELS:
-            raise ValueError(f"label must be one of the supported labels: {', '.join(LABELS)}")
-        return value
+        return normalize_label(value)
 
     @field_validator("landmarks")
     @classmethod
@@ -82,9 +98,7 @@ class SampleUpdate(BaseModel):
     @field_validator("label")
     @classmethod
     def validate_label(cls, value: Optional[str]) -> Optional[str]:
-        if value is not None and value not in LABELS:
-            raise ValueError(f"label must be one of the supported labels: {', '.join(LABELS)}")
-        return value
+        return normalize_label(value) if value is not None else None
 
     @field_validator("landmarks")
     @classmethod

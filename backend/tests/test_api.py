@@ -157,13 +157,54 @@ def test_training_requires_all_labels_and_prediction_requires_model(client):
     train_response = client.post("/api/train")
     assert train_response.status_code == 409
     assert train_response.json()["detail"]["code"] == "insufficient_categories"
-    assert train_response.json()["detail"]["categories"]["ㄱ"] == 2
-    assert len(train_response.json()["detail"]["categories"]) == len(LABELS)
+    assert train_response.json()["detail"]["categories"] == {"ㄱ": 2}
     assert train_response.json()["detail"]["required_per_label"] == 3
 
     prediction = client.post("/api/predict", json={"landmarks": landmarks()})
     assert prediction.status_code == 404
     assert client.get("/api/model/report").status_code == 404
+
+
+def test_custom_labels_can_be_saved_and_trained(client):
+    created_label = client.post("/api/labels", json={"label": "你好"})
+    assert created_label.status_code == 201
+    assert "你好" in created_label.json()["labels"]
+    assert "你好" in DatasetStore(main.store.data_dir).list_labels()
+    assert client.post("/api/labels", json={"label": "你好"}).status_code == 409
+    assert client.post(
+        "/api/samples",
+        json={"label": "未登记", "landmarks": landmarks(50)},
+    ).status_code == 422
+
+    for label, offset in (("ㄱ", 0), ("你好", 10)):
+        for variation in range(3):
+            response = client.post(
+                "/api/samples",
+                json={
+                    "label": label,
+                    "landmarks": landmarks(offset + variation),
+                },
+            )
+            assert response.status_code == 201
+
+    assert client.get("/api/samples/summary").json()["by_label"]["你好"] == 3
+    report_response = client.post("/api/train")
+    assert report_response.status_code == 200
+    assert report_response.json()["labels"] == ["ㄱ", "你好"]
+    assert client.get("/api/health").json()["model_ready"] is True
+    assert (main.store.data_dir / "random_forest.joblib").exists()
+
+    deleted_label = client.delete("/api/labels", params={"label": "你好"})
+    assert deleted_label.status_code == 200
+    assert deleted_label.json()["deleted_samples"] == 3
+    assert "你好" not in deleted_label.json()["labels"]
+    assert client.get("/api/samples/summary").json()["total"] == 3
+    assert client.get("/api/samples", params={"label": "你好"}).status_code == 422
+    assert client.get("/api/health").json()["model_ready"] is False
+    assert not (main.store.data_dir / "random_forest.joblib").exists()
+
+    assert client.delete("/api/labels", params={"label": "ㄱ"}).status_code == 409
+    assert client.delete("/api/labels", params={"label": "不存在"}).status_code == 404
 
 
 def test_training_report_and_prediction(client):

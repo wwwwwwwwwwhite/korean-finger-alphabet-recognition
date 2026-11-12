@@ -22,7 +22,10 @@ def invalidate_model(data_dir: Path) -> None:
 
 
 def category_counts(samples: list[dict[str, Any]]) -> dict[str, int]:
-    counts = dict.fromkeys(LABELS, 0)
+    present_labels = {sample["label"] for sample in samples}
+    ordered_labels = [label for label in LABELS if label in present_labels]
+    ordered_labels.extend(sorted(present_labels.difference(LABELS)))
+    counts = dict.fromkeys(ordered_labels, 0)
     for sample in samples:
         if sample["label"] in counts:
             counts[sample["label"]] += 1
@@ -34,18 +37,20 @@ def train_model(samples: list[dict[str, Any]], data_dir: Path) -> dict[str, Any]
     insufficient = {
         label: count for label, count in counts.items() if count < MIN_SAMPLES_PER_LABEL
     }
-    if insufficient:
+    if insufficient or len(counts) < 2:
         raise ValueError(
             {
                 "code": "insufficient_categories",
                 "message": (
-                    "Training requires at least three recorded samples for every "
-                    "supported label: two for training and one for holdout evaluation."
+                    "Training requires at least two labels with at least three "
+                    "recorded samples each."
                 ),
                 "required_per_label": MIN_SAMPLES_PER_LABEL,
                 "categories": insufficient,
+                "minimum_categories": 2,
             }
         )
+    labels = list(counts)
 
     features = np.vstack(
         [
@@ -62,7 +67,7 @@ def train_model(samples: list[dict[str, Any]], data_dir: Path) -> dict[str, Any]
         random_state=42,
         n_jobs=-1,
     )
-    test_size = max(len(LABELS), int(np.ceil(len(samples) * 0.2)))
+    test_size = max(len(labels), int(np.ceil(len(samples) * 0.2)))
     train_features, test_features, train_targets, test_targets = train_test_split(
         features,
         targets,
@@ -75,11 +80,11 @@ def train_model(samples: list[dict[str, Any]], data_dir: Path) -> dict[str, Any]
     report_data = classification_report(
         test_targets,
         test_predictions,
-        labels=LABELS,
+        labels=labels,
         output_dict=True,
         zero_division=0,
     )
-    confusion = confusion_matrix(test_targets, test_predictions, labels=LABELS)
+    confusion = confusion_matrix(test_targets, test_predictions, labels=labels)
     per_class = [
         {
             "label": label,
@@ -88,10 +93,10 @@ def train_model(samples: list[dict[str, Any]], data_dir: Path) -> dict[str, Any]
             "f1_score": float(report_data[label]["f1-score"]),
             "support": int(report_data[label]["support"]),
         }
-        for label in LABELS
+        for label in labels
     ]
     report = {
-        "labels": LABELS,
+        "labels": labels,
         "accuracy": float(accuracy_score(test_targets, test_predictions)),
         "precision": float(report_data["macro avg"]["precision"]),
         "recall": float(report_data["macro avg"]["recall"]),

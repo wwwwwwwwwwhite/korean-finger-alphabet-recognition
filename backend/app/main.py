@@ -7,9 +7,9 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 
-from .constants import LABELS, MIN_SAMPLES_PER_LABEL
+from .constants import MIN_SAMPLES_PER_LABEL
 from .model import invalidate_model, load_model, predict, train_model
-from .schemas import PredictionInput, SampleInput, SampleUpdate
+from .schemas import CustomLabelInput, PredictionInput, SampleInput, SampleUpdate
 from .storage import CSV_COLUMNS, DatasetStore, DuplicateSampleError
 
 app = FastAPI(title="Korean Finger Alphabet Recognition API", version="1.0.0")
@@ -47,11 +47,34 @@ def health() -> dict[str, Any]:
 
 @app.get("/api/labels")
 def get_labels() -> dict[str, list[str]]:
-    return {"labels": LABELS}
+    return {"labels": store.list_labels()}
+
+
+@app.post("/api/labels", status_code=status.HTTP_201_CREATED)
+def create_label(body: CustomLabelInput) -> dict[str, list[str]]:
+    try:
+        labels = store.add_custom_label(body.label)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"labels": labels}
+
+
+@app.delete("/api/labels")
+def delete_label(label: str = Query(..., min_length=1, max_length=24)) -> dict[str, Any]:
+    try:
+        labels, deleted_samples = store.delete_custom_label(label)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Custom label not found") from exc
+    invalidate_model(_data_dir())
+    return {"labels": labels, "deleted_samples": deleted_samples}
 
 
 @app.post("/api/samples", status_code=status.HTTP_201_CREATED)
 def create_sample(body: SampleInput) -> dict[str, Any]:
+    if body.label not in store.list_labels():
+        raise HTTPException(status_code=422, detail="Unsupported label")
     try:
         sample = store.create_sample(body.label, body.landmarks, body.session_id)
     except DuplicateSampleError as exc:
@@ -69,7 +92,7 @@ def create_sample(body: SampleInput) -> dict[str, Any]:
 
 @app.get("/api/samples")
 def list_samples(label: Optional[str] = Query(default=None)) -> list[dict[str, str]]:
-    if label is not None and label not in LABELS:
+    if label is not None and label not in store.list_labels():
         raise HTTPException(status_code=422, detail="Unsupported label")
     samples = store.list_samples()
     if label is not None:
@@ -80,7 +103,7 @@ def list_samples(label: Optional[str] = Query(default=None)) -> list[dict[str, s
 @app.get("/api/samples/summary")
 def dataset_summary() -> dict[str, Any]:
     samples = store.list_samples()
-    counts = dict.fromkeys(LABELS, 0)
+    counts = dict.fromkeys(store.list_labels(), 0)
     for sample in samples:
         counts[sample["label"]] += 1
     return {"total": len(samples), "by_label": counts}
@@ -101,6 +124,8 @@ def get_sample(sample_id: str) -> dict[str, Any]:
 
 @app.put("/api/samples/{sample_id}")
 def update_sample(sample_id: str, body: SampleUpdate) -> dict[str, Any]:
+    if body.label is not None and body.label not in store.list_labels():
+        raise HTTPException(status_code=422, detail="Unsupported label")
     try:
         updated = store.update_sample(
             sample_id,
@@ -133,7 +158,7 @@ def delete_sample(sample_id: str) -> Response:
 @app.get("/api/dataset/stats")
 def dataset_stats() -> dict[str, Any]:
     samples = store.list_samples()
-    counts = dict.fromkeys(LABELS, 0)
+    counts = dict.fromkeys(store.list_labels(), 0)
     for sample in samples:
         counts[sample["label"]] += 1
     return {

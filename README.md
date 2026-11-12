@@ -2,8 +2,9 @@
 
 A local-first web app for collecting Korean fingerspelling samples, training a
 Random Forest classifier, and trying real-time recognition from a webcam. It
-recognizes only the configured basic Korean consonant and vowel labels. It does
-not translate sentences or use ASL/JSL label mappings.
+recognizes the basic Korean consonant and vowel labels, plus custom static
+gesture labels added by the user. It does not translate sentences or use
+ASL/JSL label mappings.
 
 ## Important: gestures, data, and expected accuracy
 
@@ -34,8 +35,12 @@ model for this exact MediaPipe + scikit-learn pipeline was identified:
 
 Accordingly, this project starts with an **empty dataset and no trained
 classifier**. Live predictions remain unavailable until you collect data and
-train. No random or fabricated predictions are shown. Recognition quality
-depends on the quality and diversity of the user's labeled captures.
+train. No random or fabricated predictions are shown. Custom labels are for
+static hand shapes only; moving word gestures such as “안녕하세요” (hello) or
+“감사합니다” (thank you) require
+sequence modeling and are not recognized as actions by this frame-based model.
+Recognition quality depends on the quality and diversity of the user's labeled
+captures.
 
 ## Features
 
@@ -43,7 +48,7 @@ depends on the quality and diversity of the user's labeled captures.
 - MediaPipe Tasks Vision hand tracking in the browser; draws and sends the
   21 hand landmarks' `x`, `y`, and `z` values. Camera video is not uploaded.
 - FastAPI backend with CSV-backed capture, category counts, sample deletion,
-  and CSV export.
+  custom label persistence/deletion, and CSV export.
 - Landmark centering/scaling normalization, same-class near-duplicate
   rejection, and a scikit-learn Random Forest classifier.
 - Training metrics: accuracy, macro precision/recall/F1, per-letter
@@ -64,11 +69,12 @@ Consonants: `ㄱ ㄴ ㄷ ㄹ ㅁ ㅂ ㅅ ㅇ ㅈ ㅊ ㅋ ㅌ ㅍ ㅎ`
 
 Vowels: `ㅏ ㅑ ㅓ ㅕ ㅗ ㅛ ㅜ ㅠ ㅡ ㅣ ㅐ ㅔ`
 
-Every class must have at least **3 distinct accepted samples** before training
-(two training examples plus at least one held-out example per class). With all
-26 labels this means at least 78 accepted examples. Near-identical normalized
-landmarks for the same label are rejected; move or reorient the hand between
-captures. This minimum is not a promise of good accuracy.
+Each label included in training must have at least **3 distinct accepted
+samples** (two training examples plus at least one held-out example per class),
+and at least two labels must be represented. Labels with no samples are not
+included in training. Near-identical normalized landmarks for the same label
+are rejected; move or reorient the hand between captures. This minimum is not
+a promise of good accuracy.
 
 ## Requirements
 
@@ -100,7 +106,7 @@ Terminal 1 — backend:
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
-python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000
+python -m uvicorn app.main:app --app-dir backend --host 127.0.0.1 --port 8000 --reload
 ```
 
 Terminal 2 — frontend:
@@ -118,12 +124,16 @@ Open [http://localhost:5173](http://localhost:5173). The Vite dev server proxies
 
 1. Open **Data Collection**, start the camera, choose a label, and begin
    capture. Hold the verified Korean pose and vary the hand's position or
-   orientation; near-duplicate samples are skipped. Repeat for all 26 labels.
+   orientation; near-duplicate samples are skipped. You may add a custom
+   static gesture label from **Learn Letters**. Create a different custom label
+   for each gesture category you want to distinguish. Custom labels can also be
+   deleted there; deletion requires confirmation and permanently removes that
+   label's samples and invalidates the trained model.
 2. Use the per-letter counts to find missing or underrepresented classes.
    Review/delete bad samples and use **Export CSV** for a backup.
-3. Open **Model Training** and train after every label has at least three
-   accepted samples. Review the holdout scores, per-letter recall, and
-   confusion matrix.
+3. Open **Model Training** and train after at least two labels each have three
+   accepted samples. Every label with captured samples must meet that minimum.
+   Review the holdout scores, per-class recall, and confusion matrix.
 4. Open **Live Recognition**, allow camera access, and choose a confidence
    threshold. **Auto-add stable letters** is on by default: a prediction is
    appended once after it remains stable and above threshold for about 700 ms.
@@ -133,13 +143,16 @@ Open [http://localhost:5173](http://localhost:5173). The Vite dev server proxies
 
 Adding or deleting samples invalidates the saved model, so retrain before
 recognition. Captured landmarks are stored in `data/dataset.csv`; the classifier
-is stored in `data/random_forest.joblib`. Both are local and ignored by Git.
-Back up the CSV if you want to preserve your collection.
+is stored in `data/random_forest.joblib`; custom labels are stored in
+`data/custom_labels.json`. These are local and ignored by Git. Back up the CSV
+and custom-label file if you want to preserve your collection.
 
 ## API overview
 
 - `GET /api/health`
 - `GET /api/labels`
+- `POST /api/labels` to add a custom label
+- `DELETE /api/labels?label={label}` to remove a custom label and its samples
 - `GET /api/samples` and `GET /api/samples/summary`
 - `POST /api/samples` with a supported label, 21 `{x,y,z}` points, and optional
   `session_id`
@@ -148,9 +161,14 @@ Back up the CSV if you want to preserve your collection.
 - `POST /api/train`
 - `POST /api/predict` with 21 `{x,y,z}` points
 
-`POST /api/train` returns `409` with per-label counts until every supported
-label meets the minimum. `POST /api/predict` returns `404` until a model has
-been trained. Dataset changes invalidate the saved model.
+`POST /api/train` returns `409` with per-label counts until at least two labels
+with samples meet the minimum. `POST /api/predict` returns `404` until a model
+has been trained. Dataset changes invalidate the saved model.
+
+The local startup script and manual backend command use Uvicorn reload mode so
+backend source changes are picked up automatically. If an older server process
+is already running without reload, stop it with `Ctrl+C` and restart the app
+once before using newly added API routes.
 
 ## Development checks
 

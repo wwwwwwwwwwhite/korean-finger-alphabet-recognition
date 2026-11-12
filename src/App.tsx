@@ -1,17 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import {
   Activity,
   AlertCircle,
   ArrowDownToLine,
   Camera,
   Check,
-  ChevronRight,
   CircleHelp,
   Cpu,
   Database,
   GraduationCap,
   Hand,
   LoaderCircle,
+  Plus,
   Play,
   RotateCcw,
   Trash2,
@@ -42,6 +42,7 @@ type TrainReport = {
 const consonants = ["ㄱ", "ㄴ", "ㄷ", "ㄹ", "ㅁ", "ㅂ", "ㅅ", "ㅇ", "ㅈ", "ㅊ", "ㅋ", "ㅌ", "ㅍ", "ㅎ"];
 const vowels = ["ㅏ", "ㅑ", "ㅓ", "ㅕ", "ㅗ", "ㅛ", "ㅜ", "ㅠ", "ㅡ", "ㅣ", "ㅐ", "ㅔ"];
 const letters = [...consonants, ...vowels];
+const CAPTURE_INTERVAL_MS = 300;
 const connections: [number, number][] = [
   [0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8],
   [5, 9], [9, 10], [10, 11], [11, 12], [9, 13], [13, 14], [14, 15], [15, 16],
@@ -82,6 +83,7 @@ function App() {
   const [autoCommit, setAutoCommit] = useState(true);
   const [threshold, setThreshold] = useState(0.65);
   const [summary, setSummary] = useState<SampleSummary>({ total: 0, by_label: {} });
+  const [availableLabels, setAvailableLabels] = useState<string[]>(letters);
   const [samples, setSamples] = useState<Sample[]>([]);
   const [collecting, setCollecting] = useState(false);
   const [message, setMessage] = useState("");
@@ -90,6 +92,11 @@ function App() {
   const [modelReady, setModelReady] = useState(false);
   const [apiReady, setApiReady] = useState<boolean | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
+  const [customLabelOpen, setCustomLabelOpen] = useState(false);
+  const [customLabelDraft, setCustomLabelDraft] = useState("");
+  const [savingLabel, setSavingLabel] = useState(false);
+  const [labelToDelete, setLabelToDelete] = useState<string | null>(null);
+  const [deletingLabel, setDeletingLabel] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -97,6 +104,7 @@ function App() {
   const lastFrameRef = useRef(0);
   const lastPredictionAt = useRef(0);
   const lastCaptureAt = useRef(0);
+  const captureRequestInFlight = useRef(false);
   const captureSessionId = useRef<string | null>(null);
   const lastDuplicateNoticeAt = useRef(0);
   const predictionWindow = useRef<Prediction[]>([]);
@@ -106,12 +114,14 @@ function App() {
 
   const refreshSamples = useCallback(async () => {
     try {
-      const [data, list] = await Promise.all([
+      const [data, list, labelData] = await Promise.all([
         request<SampleSummary>("/samples/summary"),
         request<Sample[]>("/samples"),
+        request<{ labels: string[] }>("/labels"),
       ]);
       setSummary(data);
       setSamples(list);
+      setAvailableLabels(labelData.labels);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Could not load dataset.");
     }
@@ -212,8 +222,14 @@ function App() {
             ctx.arc(point.x * canvas.width, point.y * canvas.height, Math.max(2.5, canvas.width / 240), 0, Math.PI * 2);
             ctx.fill();
           }
-          if (page === "collect" && collecting && now - lastCaptureAt.current >= 800) {
+          if (
+            page === "collect"
+            && collecting
+            && !captureRequestInFlight.current
+            && now - lastCaptureAt.current >= CAPTURE_INTERVAL_MS
+          ) {
             lastCaptureAt.current = now;
+            captureRequestInFlight.current = true;
             void request<Sample>("/samples", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -236,6 +252,8 @@ function App() {
               }
               setCollecting(false);
               setMessage(error instanceof Error ? error.message : "Could not save sample.");
+            }).finally(() => {
+              captureRequestInFlight.current = false;
             });
           }
           if (page === "recognize" && modelReady && now - lastPredictionAt.current >= 120) {
@@ -276,7 +294,6 @@ function App() {
                 ) {
                   setLetterBuffer((current) => [...current, next.label]);
                   committedLabel.current = next.label;
-                  setMessage(`${next.label} added automatically`);
                 }
               }
             }).catch(() => {
@@ -356,6 +373,60 @@ function App() {
     }
   };
 
+  const addCustomLabel = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const label = customLabelDraft.trim();
+    if (!label || savingLabel) return;
+    setSavingLabel(true);
+    try {
+      const result = await request<{ labels: string[] }>("/labels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label }),
+      });
+      setAvailableLabels(result.labels);
+      setSelected(label);
+      setCustomLabelDraft("");
+      setCustomLabelOpen(false);
+      setMessage(`“${label}” added · 추가됨. Select it in Data Collection to record samples.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not add custom gesture.");
+    } finally {
+      setSavingLabel(false);
+    }
+  };
+
+  const deleteCustomLabel = async () => {
+    const label = labelToDelete;
+    if (!label || deletingLabel) return;
+    setDeletingLabel(true);
+    try {
+      const result = await request<{ labels: string[]; deleted_samples: number }>(
+        `/labels?label=${encodeURIComponent(label)}`,
+        { method: "DELETE" },
+      );
+      setAvailableLabels(result.labels);
+      setSamples((current) => current.filter((sample) => sample.label !== label));
+      setSummary((current) => ({
+        total: current.total - (current.by_label[label] ?? 0),
+        by_label: Object.fromEntries(
+          Object.entries(current.by_label).filter(([currentLabel]) => currentLabel !== label),
+        ),
+      }));
+      setSelected((current) => current === label ? letters[0] : current);
+      setModelReady(false);
+      setReport(null);
+      setLabelToDelete(null);
+      setMessage(`“${label}” deleted · 삭제됨. Removed ${result.deleted_samples} samples.`);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not delete custom gesture.");
+    } finally {
+      setDeletingLabel(false);
+    }
+  };
+
+  const customLabels = availableLabels.filter((label) => !letters.includes(label));
+  const collectedClassCount = Object.values(summary.by_label).filter((count) => count > 0).length;
   const recognizedText = composeHangul(letterBuffer);
   const camera = (
     <div className="camera-shell">
@@ -432,12 +503,12 @@ function App() {
               </div>
             </section>
             <div className="right-column">
-              <section className="panel prediction-panel">
+              <section className="panel recognition-panel">
                 <div className="panel-heading compact"><div><h2>Current prediction</h2><p>Smoothed across recent frames</p></div><Activity size={18} className="muted-icon" /></div>
                 <div className="prediction-display">
                   <div className="prediction-letter">{modelReady && stablePrediction && stablePrediction.confidence >= threshold ? stablePrediction.label : "—"}</div>
                   <div className="prediction-meta">
-                    <span className="prediction-caption">PREDICTED LETTER</span>
+                    <span className="prediction-caption">PREDICTED LABEL</span>
                     <strong>{stablePrediction ? `${Math.round(stablePrediction.confidence * 100)}%` : "--"}</strong>
                     <span className="confidence-track"><i style={{ width: `${Math.min(100, (stablePrediction?.confidence ?? 0) * 100)}%` }} /></span>
                   </div>
@@ -446,14 +517,6 @@ function App() {
                   <input type="range" min="0.4" max="0.95" step="0.05" value={threshold} onChange={(event) => setThreshold(Number(event.target.value))} />
                 </label>
                 {!modelReady && <div className="inline-note"><AlertCircle size={15} /> Collect samples and train a model to enable recognition.</div>}
-              </section>
-
-              <section className="panel letters-panel">
-                <div className="panel-heading compact"><div><h2>Alphabet</h2><p>Basic consonants · 자음 &nbsp; / &nbsp; vowels · 모음</p></div><button className="text-button" onClick={() => setPage("learn")}>Learn <ChevronRight size={14} /></button></div>
-                <div className="letter-groups">
-                  <div className="letter-row"><span className="group-label">자음</span><div className="letter-chips">{consonants.map((letter) => <button key={letter} onClick={() => setSelected(letter)} className={stablePrediction?.label === letter ? "letter-chip active" : "letter-chip"}>{letter}</button>)}</div></div>
-                  <div className="letter-row"><span className="group-label">모음</span><div className="letter-chips">{vowels.map((letter) => <button key={letter} onClick={() => setSelected(letter)} className={stablePrediction?.label === letter ? "letter-chip active" : "letter-chip"}>{letter}</button>)}</div></div>
-                </div>
               </section>
 
               <section className="panel text-panel">
@@ -492,13 +555,14 @@ function App() {
                   ? <button className="button primary" disabled={!cameraOn || !hasHand} onClick={() => { lastCaptureAt.current = 0; captureSessionId.current = crypto.randomUUID(); setCollecting(true); }}><Database size={16} /> Start capture</button>
                   : <button className="button danger" onClick={() => setCollecting(false)}><X size={16} /> Stop capture</button>}
               </div>
-              {collecting && <div className="capture-notice"><i className="pulse-dot" /> Capturing every 800 ms · move your hand between samples</div>}
+              {collecting && <div className="capture-notice"><i className="pulse-dot" /> Sampling every 300 ms · similar poses are skipped, so move your hand between samples</div>}
             </section>
             <section className="panel dataset-panel">
               <div className="panel-heading"><div><h2>Dataset</h2><p>{summary.total} labeled samples</p></div><button className="icon-button export-button" onClick={() => void exportCsv()} title="Export CSV"><ArrowDownToLine size={17} /></button></div>
               <div className="letter-groups collection-picker">
                 <div className="letter-row"><span className="group-label">자음</span><div className="letter-chips">{consonants.map((letter) => <button key={letter} onClick={() => setSelected(letter)} className={selected === letter ? "letter-chip selected-letter" : "letter-chip"}>{letter}<small>{summary.by_label[letter] ?? 0}</small></button>)}</div></div>
                 <div className="letter-row"><span className="group-label">모음</span><div className="letter-chips">{vowels.map((letter) => <button key={letter} onClick={() => setSelected(letter)} className={selected === letter ? "letter-chip selected-letter" : "letter-chip"}>{letter}<small>{summary.by_label[letter] ?? 0}</small></button>)}</div></div>
+                {customLabels.length > 0 && <div className="letter-row"><span className="group-label custom-group-label">사용자 · Custom</span><div className="letter-chips">{customLabels.map((label) => <button key={label} onClick={() => setSelected(label)} className={selected === label ? "letter-chip selected-letter custom-chip" : "letter-chip custom-chip"}>{label}<small>{summary.by_label[label] ?? 0}</small></button>)}</div></div>}
               </div>
               <div className="sample-list-heading"><span>RECENT SAMPLES</span><button onClick={() => void refreshSamples()}>Refresh</button></div>
               <div className="sample-list">
@@ -516,14 +580,14 @@ function App() {
           <div className="train-layout">
             <section className="panel train-intro">
               <div className="train-icon"><Cpu size={24} /></div>
-              <div><h2>Train a Random Forest classifier</h2><p>Training uses only the samples you collected. Samples are split into train and test sets; no synthetic duplication is performed.</p></div>
+              <div><h2>Train a Random Forest classifier</h2><p>Train on collected labels only. Each label needs at least 3 samples, and at least 2 labels are required; samples are split into train and test sets.</p></div>
               <button className="button primary train-button" disabled={working || summary.total === 0} onClick={() => void trainModel()}>
                 {working ? <><LoaderCircle size={16} className="spin" /> Training…</> : <><Play size={16} /> Train model</>}
               </button>
             </section>
             <div className="metrics-grid">
               <Metric title="Total samples" value={summary.total.toString()} note="Your labeled dataset" />
-              <Metric title="Classes collected" value={`${Object.keys(summary.by_label).filter((key) => summary.by_label[key] > 0).length} / ${letters.length}`} note="Consonants + vowels" />
+              <Metric title="Classes collected" value={`${collectedClassCount} / ${availableLabels.length}`} note="Letters + custom gestures" />
               <Metric title="Model status" value={modelReady ? "Ready" : "Not trained"} note={modelReady ? "Saved locally" : "Requires sufficient samples"} />
             </div>
             {report ? (
@@ -536,8 +600,8 @@ function App() {
                     <Score label="Recall" value={report.recall} />
                     <Score label="F1 score" value={report.f1_score} />
                   </div>
-                  <h3 className="table-title">Per-letter performance</h3>
-                  <div className="table-scroll"><table><thead><tr><th>Letter</th><th>Precision</th><th>Recall</th><th>F1</th><th>Test samples</th></tr></thead><tbody>
+                  <h3 className="table-title">Per-class performance</h3>
+                  <div className="table-scroll"><table><thead><tr><th>Label</th><th>Precision</th><th>Recall</th><th>F1</th><th>Test samples</th></tr></thead><tbody>
                     {report.per_class.map((row) => {
                       const label = row.label;
                       return <tr key={label}><td className="table-letter">{label}</td><td>{(row.precision * 100).toFixed(1)}%</td><td>{(row.recall * 100).toFixed(1)}%</td><td>{(row.f1_score * 100).toFixed(1)}%</td><td>{row.support}</td></tr>;
@@ -552,7 +616,7 @@ function App() {
               <section className="panel empty-report">
                 <div className="empty-report-icon"><Activity size={24} /></div>
                 <h2>No evaluation yet</h2>
-                <p>Collect examples across the letters you want to recognize, then train to see honest held-out metrics here.</p>
+                <p>Collect examples across the labels you want to recognize, then train to see held-out metrics here.</p>
               </section>
             )}
           </div>
@@ -572,11 +636,25 @@ function App() {
               </div>
             </div>
             <section className="panel learn-panel">
-              <div className="panel-heading"><div><h2>First-stage alphabet</h2><p>지문자 · Korean manual alphabet category set</p></div><span className="soft-tag">26 LETTERS</span></div>
+              <div className="panel-heading">
+                <div><h2>First-stage alphabet</h2><p>지문자 · Korean manual alphabet category set</p></div>
+                <button className="button secondary add-label-button" onClick={() => setCustomLabelOpen(true)}><Plus size={15} /> 동작 추가 · Add gesture</button>
+              </div>
               <h3 className="learn-group-title">자음 <span>Consonants</span></h3>
               <div className="learn-grid">{consonants.map((letter, i) => <button key={letter} className={selected === letter ? "learn-card chosen" : "learn-card"} onClick={() => setSelected(letter)}><span className="learn-letter">{letter}</span><span className="learn-index">CONSONANT {String(i + 1).padStart(2, "0")}</span><span className="learn-count">{summary.by_label[letter] ?? 0} samples</span></button>)}</div>
               <h3 className="learn-group-title">모음 <span>Vowels</span></h3>
               <div className="learn-grid">{vowels.map((letter, i) => <button key={letter} className={selected === letter ? "learn-card chosen" : "learn-card"} onClick={() => setSelected(letter)}><span className="learn-letter">{letter}</span><span className="learn-index">VOWEL {String(i + 1).padStart(2, "0")}</span><span className="learn-count">{summary.by_label[letter] ?? 0} samples</span></button>)}</div>
+              {customLabels.length > 0 && <>
+                <h3 className="learn-group-title">사용자 지정 정적 동작 <span>Custom static gestures</span></h3>
+                <div className="custom-label-list">{customLabels.map((label) => <div key={label} className="custom-label-item">
+                  <button className="learn-card custom-learn-card" onClick={() => { setSelected(label); setPage("collect"); }}>
+                    <span className="learn-letter custom-learn-letter">{label}</span>
+                    <span className="learn-index">CUSTOM GESTURE</span>
+                    <span className="learn-count">{summary.by_label[label] ?? 0} samples · click to collect</span>
+                  </button>
+                  <button className="custom-label-delete" aria-label={`Delete custom gesture ${label}`} title="Delete gesture and its samples" onClick={() => setLabelToDelete(label)}><Trash2 size={15} /></button>
+                </div>)}</div>
+              </>}
               <div className="learn-footer">Gesture poses are not illustrated here until verified against an authoritative Korean standard. Use the data collection page to label your captures only after checking a trusted reference.</div>
             </section>
           </div>
@@ -584,6 +662,35 @@ function App() {
 
         <footer className="footer"><span>SON · KOREAN FINGER ALPHABET LAB</span><span>Local-first · Video stays in your browser</span></footer>
       </main>
+      {customLabelOpen && <div className="modal-backdrop" onClick={() => setCustomLabelOpen(false)}>
+        <section className="help-modal custom-label-modal" role="dialog" aria-modal="true" aria-labelledby="custom-label-title" onClick={(event) => event.stopPropagation()}>
+          <button className="modal-close" aria-label="Close" onClick={() => setCustomLabelOpen(false)}><X size={18} /></button>
+          <div className="train-icon"><Hand size={22} /></div>
+          <h2 id="custom-label-title">사용자 동작 추가 · Add a custom gesture</h2>
+          <p>단어나 동작 이름을 입력하세요. 학습 전에 데이터 수집 페이지에서 이 동작과 다른 라벨의 샘플을 각각 3개 이상 수집하세요.<br />Enter a word or gesture name. Collect at least 3 samples for it and another label before training.</p>
+          <form onSubmit={(event) => void addCustomLabel(event)}>
+            <label className="custom-label-field">단어 / 동작 이름 · Word / gesture name
+              <input autoFocus maxLength={24} value={customLabelDraft} onChange={(event) => setCustomLabelDraft(event.target.value)} placeholder="예: 안녕하세요 · e.g. Hello" required />
+            </label>
+            <div className="custom-label-actions">
+              <button className="button secondary" type="button" onClick={() => setCustomLabelOpen(false)}>Cancel</button>
+              <button className="button primary" type="submit" disabled={savingLabel || !customLabelDraft.trim()}>{savingLabel ? "추가 중… · Adding…" : "추가 · Add gesture"}</button>
+            </div>
+          </form>
+        </section>
+      </div>}
+      {labelToDelete && <div className="modal-backdrop" onClick={() => { if (!deletingLabel) setLabelToDelete(null); }}>
+        <section className="help-modal custom-label-modal" role="dialog" aria-modal="true" aria-labelledby="delete-label-title" onClick={(event) => event.stopPropagation()}>
+          <button className="modal-close" aria-label="Close" disabled={deletingLabel} onClick={() => setLabelToDelete(null)}><X size={18} /></button>
+          <div className="train-icon delete-label-icon"><Trash2 size={21} /></div>
+          <h2 id="delete-label-title">“{labelToDelete}” 삭제 · Delete?</h2>
+          <p>이 사용자 동작과 수집한 샘플 {summary.by_label[labelToDelete] ?? 0}개가 영구 삭제됩니다. 학습된 모델도 초기화됩니다.<br />This permanently deletes the custom gesture and its samples. The trained model will also be cleared.</p>
+          <div className="custom-label-actions">
+            <button className="button secondary" disabled={deletingLabel} onClick={() => setLabelToDelete(null)}>취소 · Cancel</button>
+            <button className="button danger" disabled={deletingLabel} onClick={() => void deleteCustomLabel()}>{deletingLabel ? "삭제 중… · Deleting…" : "동작 및 샘플 삭제 · Delete"}</button>
+          </div>
+        </section>
+      </div>}
       {helpOpen && <div className="modal-backdrop" onClick={() => setHelpOpen(false)}><section className="help-modal" onClick={(event) => event.stopPropagation()}><button className="modal-close" onClick={() => setHelpOpen(false)}><X size={18} /></button><div className="train-icon"><Hand size={22} /></div><h2>About Son</h2><p>A local-first Korean fingerspelling research and practice tool. It detects 21 hand landmarks in your browser and sends only coordinates to the local API.</p><div className="modal-note"><b>Important:</b> There is no bundled pretrained model or sample dataset. Recognition becomes available only after collecting labeled data and training a model.</div><button className="button primary" onClick={() => setHelpOpen(false)}>Got it</button></section></div>}
     </div>
   );

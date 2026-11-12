@@ -11,7 +11,7 @@ import numpy as np
 
 from .constants import LABELS, MAX_NORMALIZED_LANDMARK_RMS_DISTANCE
 from .normalization import normalize_landmarks
-from .schemas import Landmark
+from .schemas import Landmark, normalize_label
 
 CSV_COLUMNS = ("id", "label", "landmarks", "session_id", "created_at", "updated_at")
 
@@ -33,24 +33,25 @@ class DatasetStore:
     def __init__(self, data_dir: Optional[Path] = None) -> None:
         self.data_dir = data_dir or default_data_dir()
         self.csv_path = self.data_dir / "dataset.csv"
+        self.custom_labels_path = self.data_dir / "custom_labels.json"
         self._lock = threading.RLock()
 
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    @staticmethod
-    def _deserialize_row(row: dict[str, str]) -> dict[str, Any]:
+    def _deserialize_row(self, row: dict[str, str]) -> dict[str, Any]:
         try:
+            label = normalize_label(row["label"])
             raw_points = json.loads(row["landmarks"])
             points = [Landmark.model_validate(point).model_dump() for point in raw_points]
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ValueError("dataset CSV contains an invalid landmark row") from exc
-        if row.get("label") not in LABELS or len(points) != 21:
-            raise ValueError("dataset CSV contains an invalid label or landmark count")
+        if len(points) != 21:
+            raise ValueError("dataset CSV contains an invalid landmark count")
         return {
             "id": row["id"],
-            "label": row["label"],
+            "label": label,
             "landmarks": points,
             "session_id": row.get("session_id") or None,
             "created_at": row["created_at"],
@@ -84,6 +85,54 @@ class DatasetStore:
     def list_samples(self) -> list[dict[str, Any]]:
         with self._lock:
             return self._read_unlocked()
+
+    def list_labels(self) -> list[str]:
+        with self._lock:
+            custom_labels: list[str] = []
+            if self.custom_labels_path.exists():
+                with self.custom_labels_path.open("r", encoding="utf-8") as source:
+                    stored = json.load(source)
+                if not isinstance(stored, list) or not all(isinstance(item, str) for item in stored):
+                    raise ValueError("custom label registry is invalid")
+                custom_labels = [normalize_label(item) for item in stored]
+            return [*LABELS, *(label for label in custom_labels if label not in LABELS)]
+
+    def add_custom_label(self, label: str) -> list[str]:
+        label = normalize_label(label)
+        with self._lock:
+            labels = self.list_labels()
+            if label in labels:
+                raise ValueError("label already exists")
+            custom_labels = [item for item in labels if item not in LABELS]
+            custom_labels.append(label)
+            self._write_custom_labels_unlocked(custom_labels)
+            return [*LABELS, *custom_labels]
+
+    def delete_custom_label(self, label: str) -> tuple[list[str], int]:
+        label = normalize_label(label)
+        with self._lock:
+            labels = self.list_labels()
+            if label in LABELS:
+                raise ValueError("built-in labels cannot be deleted")
+            if label not in labels:
+                raise KeyError(label)
+
+            rows = self._read_unlocked()
+            remaining_rows = [row for row in rows if row["label"] != label]
+            deleted_samples = len(rows) - len(remaining_rows)
+            if deleted_samples:
+                self._write_unlocked(remaining_rows)
+
+            custom_labels = [item for item in labels if item not in LABELS and item != label]
+            self._write_custom_labels_unlocked(custom_labels)
+            return [*LABELS, *custom_labels], deleted_samples
+
+    def _write_custom_labels_unlocked(self, labels: list[str]) -> None:
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        temporary_path = self.custom_labels_path.with_suffix(".json.tmp")
+        with temporary_path.open("w", encoding="utf-8") as destination:
+            json.dump(labels, destination, ensure_ascii=False, indent=2)
+        os.replace(temporary_path, self.custom_labels_path)
 
     def get_sample(self, sample_id: str) -> Optional[dict[str, Any]]:
         with self._lock:
